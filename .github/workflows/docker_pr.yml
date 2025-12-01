@@ -51,6 +51,6 @@ jobs:
         context: .
         platforms: linux/amd64,linux/arm64
         push: true
-        tags: anantha:pr-${{ github.event.pull_request.head.sha }}
+        tags: AevumDecessus/anantha:pr-${{ github.event.pull_request.head.sha }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
