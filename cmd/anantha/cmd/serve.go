@@ -74,9 +74,12 @@ func (m *MQTTLogger) Provides(b byte) bool {
 	return true
 }
 
-func addAllConfigSettings(ct *carrier.CarrierInfo, loadedValues *LoadedValues, sourceFileName string) {
+func addAllConfigSettings(ct *carrier.CarrierInfo, loadedValues *LoadedValues, sourceFileName string, debug bool) {
 	loadedValues.StartLoading(sourceFileName)
 	for _, setting := range ct.ConfigSettings {
+		if debug {
+			log.Printf("Updating setting %s from %s", setting.Name, sourceFileName)
+		}
 		loadedValues.Update(setting.Name, setting, time.UnixMilli(ct.TimestampMillis), sourceFileName)
 
 	}
@@ -113,7 +116,7 @@ func (m *MQTTLogger) OnPacketRead(cl *mqtt.Client, pk packets.Packet) (packets.P
 			log.Printf("Failed to unmarshal: %s", err)
 		}
 
-		addAllConfigSettings(&ct, m.loadedValues, protoFilename)
+		addAllConfigSettings(&ct, m.loadedValues, protoFilename, true)
 
 		if m.iotMQTTClient != nil {
 			iotTopic := m.toIOTTopic(pk.TopicName)
@@ -1612,6 +1615,7 @@ func init() {
 	serveCmd.Flags().String("client-id", "", "MQTT Client ID (this should be the same as the HVAC device ID, e.g. '4123X123456')")
 	serveCmd.Flags().String("external-ip-override", "", "Override auto-detected external IP")
 	serveCmd.Flags().String("thing-name-override", "", "Thingname override - you should never need to set this")
+	serveCmd.Flags().Bool("debug", false, "Enable debug logging")
 	serveCmd.Flags().Bool("proxy", false, "Proxy requests to AWS IOT - requires a valid client certificate for now (strongly discouraged)")
 }
 
@@ -1625,6 +1629,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	clientID, _ := cmd.Flags().GetString("client-id")
 	externalIPOverride, _ := cmd.Flags().GetString("external-ip-override")
 	thingNameOverride, _ := cmd.Flags().GetString("thing-name-override")
+	debugLogging, _ := cmd.Flags().GetBool("debug")
 	proxyToAWSIOT, _ := cmd.Flags().GetBool("proxy")
 
 	log.SetFlags(log.Lmicroseconds | log.Lshortfile)
@@ -1832,7 +1837,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 			return nil
 		}
 
-		addAllConfigSettings(&cInfo, loadedValues, f)
+		addAllConfigSettings(&cInfo, loadedValues, f, debugLogging)
 	}
 
 	log.Println("Done loading all proto messages")

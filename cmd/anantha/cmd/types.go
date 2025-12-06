@@ -115,7 +115,7 @@ func (l *LoadedValues) EndLoading(sourceFilename string) {
 	}
 }
 
-func (l *LoadedValues) Update(k string, v *carrier.ConfigSetting, ts time.Time, sourceFilename string) bool {
+func (l *LoadedValues) Update(k string, v *carrier.ConfigSetting, ts time.Time, sourceFilename string, debug bool) bool {
 	l.lock.Lock()
 	defer l.lock.Unlock()
 
