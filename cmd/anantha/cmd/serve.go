@@ -80,7 +80,7 @@ func addAllConfigSettings(ct *carrier.CarrierInfo, loadedValues *LoadedValues, s
 		if debug {
 			log.Printf("Updating setting %s from %s", setting.Name, sourceFileName)
 		}
-		loadedValues.Update(setting.Name, setting, time.UnixMilli(ct.TimestampMillis), sourceFileName)
+		loadedValues.Update(setting.Name, setting, time.UnixMilli(ct.TimestampMillis), sourceFileName, debug)
 
 	}
 	loadedValues.EndLoading(sourceFileName)
