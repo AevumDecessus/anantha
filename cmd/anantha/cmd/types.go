@@ -255,8 +255,12 @@ func (l *LoadedValues) OnChangeN(ctx context.Context, topics []string, callback 
 
 	l.lock.Lock()
 	for _, topic := range topics {
+		log.Printf("Checking LoadedValues for %s", topic)
 		if val, ok := l.values[topic]; ok {
+			log.Printf("Found val %s for %s", val.value, topic)
 			recentValues[topic] = val
+		} else {
+			log.Printf("No loaded value found for %s", topic)
 		}
 	}
 	l.lock.Unlock()
@@ -268,6 +272,8 @@ func (l *LoadedValues) OnChangeN(ctx context.Context, topics []string, callback 
 				args = append(args, recentValues[topic])
 			}
 			callback(args)
+		} else {
+			log.Printf("maybeCallback function length of recentValues not equal to length of topics")
 		}
 	}
 
