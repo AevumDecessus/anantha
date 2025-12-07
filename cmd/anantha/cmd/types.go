@@ -267,6 +267,7 @@ func (l *LoadedValues) OnChangeN(ctx context.Context, topics []string, callback 
 
 	maybeCallback := func() {
 		if len(recentValues) == len(topics) {
+			log.Print("Length of recentValues equals length of topics, running callback")
 			var args []TimestampedValue
 			for _, topic := range topics {
 				args = append(args, recentValues[topic])
