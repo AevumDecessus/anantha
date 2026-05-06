@@ -444,6 +444,10 @@ func runServe(cmd *cobra.Command, args []string) error {
 		cmdTopic = fmt.Sprintf("spBv1.0/WallCtrl/NCMD/%s", thingNameOverride)
 	}
 
+	// Forward-declared so debug handlers registered on the web mux can call it.
+	// Assigned once the MQTT server is up (further down in this function).
+	var publishProto func([]*carrier.ConfigSetting)
+
 	carrierHTTPMux := http.NewServeMux()
 
 	carrierHTTPMux.HandleFunc("/Alive", func(w http.ResponseWriter, r *http.Request) {
@@ -968,6 +972,61 @@ func runServe(cmd *cobra.Command, args []string) error {
 			}
 		})
 
+		// Debug: republish currently-known 1/program/.../time values back to the
+		// thermostat, to test whether the firmware echoes /activity and /enabled
+		// siblings in response. Optional ?prefix=zones (default) or ?prefix=raw
+		// to choose between "zones/1/program/..." (matches HA bridge writes) and
+		// "1/program/..." (matches what the thermostat publishes). ?dry=1 only
+		// reports what would be sent.
+		webControlMux.HandleFunc("/debug/republish-time", func(w http.ResponseWriter, r *http.Request) {
+			if publishProto == nil {
+				http.Error(w, "MQTT not ready", http.StatusServiceUnavailable)
+				return
+			}
+			prefix := r.URL.Query().Get("prefix")
+			if prefix == "" {
+				prefix = "zones"
+			}
+			dry := r.URL.Query().Get("dry") == "1"
+
+			snapshot := loadedValues.Snapshot()
+			programTimeRe := regexp.MustCompile(`^1/program/[A-Za-z]+/period [0-9]+/time$`)
+
+			var settings []*carrier.ConfigSetting
+			fmt.Fprintf(w, "prefix=%s dry=%v\n", prefix, dry)
+			for k, v := range snapshot {
+				if !programTimeRe.MatchString(k) {
+					continue
+				}
+				if v.value == nil {
+					continue
+				}
+				strVal := v.value.GetMaybeStrValue()
+				if len(strVal) == 0 {
+					continue
+				}
+				targetKey := k
+				if prefix == "zones" {
+					targetKey = "zones/" + k
+				}
+				fmt.Fprintf(w, "  %s = %q\n", targetKey, string(strVal))
+				settings = append(settings, &carrier.ConfigSetting{
+					Name:       targetKey,
+					ConfigType: carrier.ConfigType_CT_STRING,
+					Value: &carrier.ConfigSetting_MaybeStrValue{
+						MaybeStrValue: strVal,
+					},
+				})
+			}
+
+			fmt.Fprintf(w, "total settings: %d\n", len(settings))
+			if dry || len(settings) == 0 {
+				return
+			}
+			publishProto(settings)
+			fmt.Fprintln(w, "published")
+		})
+
 		webControlMux.HandleFunc("/mqtt-log", func(w http.ResponseWriter, r *http.Request) {
 			mqttLogHTML, err := RenderMQTTLog()
 			if err != nil {
@@ -1135,7 +1194,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to subscribe to provisioning topic: %w", err)
 	}
 
-	publishProto := func(cs []*carrier.ConfigSetting) {
+	publishProto = func(cs []*carrier.ConfigSetting) {
 		msg := &carrier.CarrierInfo{
 			TimestampMillis: time.Now().UnixMilli(),
 			ConfigSettings:  cs,
