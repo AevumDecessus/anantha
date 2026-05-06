@@ -1027,6 +1027,32 @@ func runServe(cmd *cobra.Command, args []string) error {
 			fmt.Fprintln(w, "published")
 		})
 
+		// Debug: send a Sparkplug-style Node Control/Rebirth command. Standard
+		// Sparkplug semantics: a CT_BOOL=true on this metric asks the edge node
+		// to republish all metrics (NBIRTH/DBIRTH). Unknown if Carrier firmware
+		// honors it.
+		webControlMux.HandleFunc("/debug/sparkplug-rebirth", func(w http.ResponseWriter, r *http.Request) {
+			if publishProto == nil {
+				http.Error(w, "MQTT not ready", http.StatusServiceUnavailable)
+				return
+			}
+			name := r.URL.Query().Get("name")
+			if name == "" {
+				name = "Node Control/Rebirth"
+			}
+			fmt.Fprintf(w, "Publishing %s = true on %s\n", name, cmdTopic)
+			publishProto([]*carrier.ConfigSetting{
+				{
+					Name:       name,
+					ConfigType: carrier.ConfigType_CT_BOOL,
+					Value: &carrier.ConfigSetting_BoolValue{
+						BoolValue: true,
+					},
+				},
+			})
+			fmt.Fprintln(w, "published")
+		})
+
 		webControlMux.HandleFunc("/mqtt-log", func(w http.ResponseWriter, r *http.Request) {
 			mqttLogHTML, err := RenderMQTTLog()
 			if err != nil {
