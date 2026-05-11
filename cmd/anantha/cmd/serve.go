@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"context"
 	"crypto/tls"
 	"embed"
 	"errors"
@@ -62,15 +61,50 @@ type MQTTLogger struct {
 
 	liveClients map[string]struct{}
 
-	rebirthCancels map[string]context.CancelFunc
-	rebirthFired   map[string]struct{}
-	rebirthLock    sync.Mutex
-	rebirthDelay   time.Duration
+	// State for the user-initiated /refresh-state button. All five fields are
+	// guarded by refreshMu.
+	refreshMu                sync.Mutex
+	firstQualifyingPublishAt time.Time   // zero when no qualifying PUBLISH seen this session
+	pendingRebirth           bool        // user clicked during the firmware NBIRTH window; fire when ready
+	pendingRebirthTimer      *time.Timer // wakes up firePendingRebirth when the NBIRTH window closes
+	rebirthLastSent          time.Time   // last successful sendRebirth, for cooldown
+}
+
+// firePendingRebirth is invoked by pendingRebirthTimer when the NBIRTH window
+// has closed. Re-checks state under the lock because CONNECT may have cleared
+// pendingRebirth, and an explicit /refresh-state click may have updated
+// rebirthLastSent during the wait. Does not log on no-op paths because they're
+// expected operating conditions, not errors.
+func (m *MQTTLogger) firePendingRebirth() {
+	const cooldown = 90 * time.Second
+
+	m.refreshMu.Lock()
+	if !m.pendingRebirth {
+		// CONNECT cleared it (or another path already fired).
+		m.refreshMu.Unlock()
+		return
+	}
+	if !m.rebirthLastSent.IsZero() && time.Since(m.rebirthLastSent) < cooldown {
+		// An explicit click during our wait already fired a rebirth. The
+		// queued one would be redundant - drop it silently.
+		m.pendingRebirth = false
+		m.refreshMu.Unlock()
+		return
+	}
+
+	m.pendingRebirth = false
+	m.rebirthLastSent = time.Now()
+	m.refreshMu.Unlock()
+
+	log.Printf("Firing queued Node Control/Rebirth (NBIRTH window cleared)")
+	m.sendRebirth()
 }
 
 // sendRebirth publishes a Sparkplug B "Node Control/Rebirth" = true command on
-// the NCMD topic. The Carrier firmware honors this: it dumps full state
-// (schedule, activity setpoints, ~2200 entries) within ~17 seconds.
+// the NCMD topic. The Carrier firmware honors this and replies with a full
+// NBIRTH/DBIRTH wave (~99 KB across 7 publishes over ~60 seconds), which
+// repopulates schedule, activity setpoints, and other config from the
+// thermostat.
 func (m *MQTTLogger) sendRebirth() {
 	msg := &carrier.CarrierInfo{
 		TimestampMillis: time.Now().UnixMilli(),
@@ -95,51 +129,6 @@ func (m *MQTTLogger) sendRebirth() {
 		return
 	}
 	log.Printf("Sent Node Control/Rebirth to %s", m.cmdTopic)
-}
-
-// scheduleRebirth arranges for sendRebirth to fire after rebirthDelay. The
-// firmware silently drops rebirth requests received during its own NBIRTH
-// window (~T+30s after CONNECT); 120s clears that with margin. The gate is
-// sticky for the session: once fired, subsequent qualifying PUBLISHes (notably
-// the firmware's NBIRTH response to our rebirth, which would otherwise re-
-// trigger us in a loop) are no-ops until CONNECT clears the state.
-// Cancellable mid-wait via the stored cancel func.
-func (m *MQTTLogger) scheduleRebirth(clientID string) {
-	m.rebirthLock.Lock()
-	if _, fired := m.rebirthFired[clientID]; fired {
-		m.rebirthLock.Unlock()
-		return
-	}
-	if _, scheduled := m.rebirthCancels[clientID]; scheduled {
-		m.rebirthLock.Unlock()
-		return
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	m.rebirthCancels[clientID] = cancel
-	m.rebirthLock.Unlock()
-
-	log.Printf("Scheduled Node Control/Rebirth in %s for %s", m.rebirthDelay, clientID)
-
-	go func() {
-		select {
-		case <-ctx.Done():
-			log.Printf("Cancelled scheduled rebirth for %s", clientID)
-			return
-		case <-time.After(m.rebirthDelay):
-		}
-
-		// Mark fired and remove from the cancel map atomically before publishing,
-		// so any qualifying PUBLISH that arrives in response to the rebirth (e.g.
-		// the firmware's NBIRTH) sees rebirthFired[clientID] and skips re-scheduling.
-		// Calling cancel() on an already-completed context is harmless, so a CONNECT
-		// racing with us cannot misfire.
-		m.rebirthLock.Lock()
-		delete(m.rebirthCancels, clientID)
-		m.rebirthFired[clientID] = struct{}{}
-		m.rebirthLock.Unlock()
-
-		m.sendRebirth()
-	}()
 }
 
 // ID returns the ID of the hook.
@@ -177,7 +166,12 @@ func (m *MQTTLogger) OnPacketRead(cl *mqtt.Client, pk packets.Packet) (packets.P
 			(m.thingNameOverride == "" && strings.HasSuffix(pk.TopicName, m.clientID)) {
 			// Client sent initial PUBLISH - ready to poll it
 			m.liveClients[cl.ID] = struct{}{}
-			m.scheduleRebirth(cl.ID)
+
+			m.refreshMu.Lock()
+			if m.firstQualifyingPublishAt.IsZero() {
+				m.firstQualifyingPublishAt = time.Now()
+			}
+			m.refreshMu.Unlock()
 		}
 		protoFilename := fmt.Sprintf("%s-%s.pb", strings.ReplaceAll(string(pk.TopicName), "/", "_"), time.Now().Format(time.RFC3339Nano))
 		if err := os.WriteFile(
@@ -250,17 +244,22 @@ func (m *MQTTLogger) OnPacketRead(cl *mqtt.Client, pk packets.Packet) (packets.P
 	case packets.Connect:
 		// Empty liveClients list on CONNECT. Make sure we get a PUBLISH spBv1.0/WallCtrl/NDATA/<thingName> before polling
 		m.liveClients = map[string]struct{}{}
-		// Cancel any in-flight rebirth timers from a prior session and clear the
-		// fired set so the next qualifying PUBLISH re-schedules. CONNECT is the
-		// canonical "new session" signal - more reliable than DISCONNECT, which
-		// won't fire on abrupt drops (power loss, wifi flap with no clean LWT).
-		m.rebirthLock.Lock()
-		for _, cancel := range m.rebirthCancels {
-			cancel()
+
+		// New MQTT session - clear refresh-button state from the prior session.
+		// firstQualifyingPublishAt will be re-set on the next qualifying PUBLISH
+		// (the first NDATA on the thingname-suffixed topic). pendingRebirth was
+		// queued by a click against the old session, so it's no longer valid;
+		// stop its timer to avoid firing into the new session at the wrong time.
+		// rebirthLastSent intentionally survives the reconnect so the cooldown
+		// can't be bypassed by power-cycling the thermostat.
+		m.refreshMu.Lock()
+		m.firstQualifyingPublishAt = time.Time{}
+		m.pendingRebirth = false
+		if m.pendingRebirthTimer != nil {
+			m.pendingRebirthTimer.Stop()
+			m.pendingRebirthTimer = nil
 		}
-		m.rebirthCancels = map[string]context.CancelFunc{}
-		m.rebirthFired = map[string]struct{}{}
-		m.rebirthLock.Unlock()
+		m.refreshMu.Unlock()
 	case packets.Pingreq:
 		// Don't log PINGREQ
 	default:
@@ -537,6 +536,10 @@ func runServe(cmd *cobra.Command, args []string) error {
 		cmdTopic = fmt.Sprintf("spBv1.0/WallCtrl/NCMD/%s", thingNameOverride)
 	}
 
+	// Forward-declared so the web mux goroutine (which starts before mLogger
+	// is constructed below) can capture it for /refresh-state.
+	var mLogger *MQTTLogger
+
 	carrierHTTPMux := http.NewServeMux()
 
 	carrierHTTPMux.HandleFunc("/Alive", func(w http.ResponseWriter, r *http.Request) {
@@ -798,12 +801,75 @@ func runServe(cmd *cobra.Command, args []string) error {
 		webControlMux.Handle("/metrics", MetricsHandler(loadedValues))
 		webControlMux.Handle("/assets/", http.FileServer(http.FS(assets)))
 		webControlMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			indexHTML, err := RenderIndex()
+			indexHTML, err := RenderIndex(loadedValues)
 			if err != nil {
 				http.Error(w, fmt.Sprintf("Error rendering index: %v", err), http.StatusInternalServerError)
 				return
 			}
 			fmt.Fprint(w, indexHTML)
+		})
+		webControlMux.HandleFunc("/refresh-state", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			if mLogger == nil {
+				// MQTT server hasn't finished initializing yet. Brief window at startup.
+				fmt.Fprint(w, `<span class="error">Anantha is still starting up. Please try again in a few seconds.</span>`)
+				return
+			}
+
+			// Subcase A: thermostat is not connected to anantha. The publish would
+			// land at the broker with no subscriber and silently disappear, so
+			// short-circuit with a clear message.
+			if len(mLogger.liveClients) == 0 {
+				fmt.Fprint(w, `<span>The thermostat is not connected to anantha yet. Please wait for it to publish before requesting a refresh.</span>`)
+				return
+			}
+
+			const cooldown = 90 * time.Second
+			const nbirthWindow = 120 * time.Second
+
+			mLogger.refreshMu.Lock()
+			now := time.Now()
+
+			// Cooldown check.
+			if !mLogger.rebirthLastSent.IsZero() {
+				if since := now.Sub(mLogger.rebirthLastSent); since < cooldown {
+					remaining := cooldown - since
+					mLogger.refreshMu.Unlock()
+					fmt.Fprintf(w, `<span>A refresh was sent recently. Please wait %d seconds before refreshing again.</span>`, int(remaining.Round(time.Second).Seconds()))
+					return
+				}
+			}
+
+			// Subcase B: thermostat is connected but still in its NBIRTH window.
+			// Queue the click and set a one-shot timer that wakes up when the
+			// window closes. A re-click during the wait stops the previous
+			// timer and starts a new one (still bounded to one fire). CONNECT
+			// stops the timer entirely since the click was for the prior session.
+			if !mLogger.firstQualifyingPublishAt.IsZero() {
+				if since := now.Sub(mLogger.firstQualifyingPublishAt); since < nbirthWindow {
+					remaining := nbirthWindow - since
+					mLogger.pendingRebirth = true
+					if mLogger.pendingRebirthTimer != nil {
+						mLogger.pendingRebirthTimer.Stop()
+					}
+					// Wait a small extra beat past the window so we're clearly
+					// past it (and so jitter doesn't put us right at the edge).
+					mLogger.pendingRebirthTimer = time.AfterFunc(remaining+2*time.Second, mLogger.firePendingRebirth)
+					mLogger.refreshMu.Unlock()
+					log.Printf("Queued user-initiated rebirth; will fire in ~%s once NBIRTH window clears", remaining.Round(time.Second))
+					fmt.Fprintf(w, `<span>The thermostat just connected and is initializing. Your refresh will fire automatically in about %d seconds.</span>`, int(remaining.Round(time.Second).Seconds()))
+					return
+				}
+			}
+
+			// Normal path: fire immediately.
+			mLogger.rebirthLastSent = now
+			mLogger.refreshMu.Unlock()
+			mLogger.sendRebirth()
+			fmt.Fprint(w, `<span>Refresh requested. Full state will arrive over the next ~60 seconds.</span>`)
 		})
 		webControlMux.HandleFunc("/schedule", func(w http.ResponseWriter, r *http.Request) {
 			scheduleHTML, err := RenderSchedule(loadedValues)
@@ -1135,7 +1201,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}))
 	level.Set(slog.LevelInfo)
 
-	mLogger := &MQTTLogger{
+	mLogger = &MQTTLogger{
 		server:            server,
 		savedProtosDir:    savedProtosDir,
 		iotMQTTClient:     awsIOTMQTTClient,
@@ -1145,9 +1211,6 @@ func runServe(cmd *cobra.Command, args []string) error {
 		subscribedTopics:  make(map[string]struct{}),
 		loadedValues:      loadedValues,
 		liveClients:       make(map[string]struct{}),
-		rebirthCancels:    make(map[string]context.CancelFunc),
-		rebirthFired:      make(map[string]struct{}),
-		rebirthDelay:      120 * time.Second,
 	}
 
 	if err := server.AddHook(mLogger, nil); err != nil {
